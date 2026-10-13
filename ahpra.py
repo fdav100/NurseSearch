@@ -317,6 +317,41 @@ def _ensure_loaded(page):
         _pg_load(page)
 
 
+OVERLAY_JS = """
+() => ({
+  frames: Array.from(document.querySelectorAll('iframe')).map(f => {
+    const r = f.getBoundingClientRect();
+    const cs = getComputedStyle(f);
+    return {
+      src: (f.src || f.getAttribute('src') || '').slice(0, 200),
+      w: Math.round(r.width), h: Math.round(r.height),
+      visible: r.width > 20 && r.height > 20 &&
+               cs.visibility !== 'hidden' && cs.display !== 'none'
+    };
+  }),
+  dialogs: Array.from(document.querySelectorAll('[role=dialog],[aria-modal=true],.modal'))
+    .map(e => (e.innerText || '').trim().slice(0, 200)).filter(Boolean)
+})
+"""
+
+
+def _pg_overlay_info(page):
+    try:
+        return page.evaluate(OVERLAY_JS)
+    except Exception:  # noqa: BLE001
+        return {"frames": [], "dialogs": []}
+
+
+def _describe_overlay(info):
+    parts = []
+    for f in info.get("frames", []):
+        if f.get("visible"):
+            parts.append(f"visible iframe {f['w']}x{f['h']}: {f['src'] or '(no src)'}")
+    for d in info.get("dialogs", []):
+        parts.append(f"dialog text: {d}")
+    return "; ".join(parts) or "no visible iframe or dialog found"
+
+
 SEARCH_BOX = (
     'input[name="name-reg"]:visible, '
     'input[placeholder*="Registration Number" i]:visible'
@@ -343,21 +378,57 @@ def _pg_predict(page, number):
     if box is None:
         raise LookupFailed("Couldn't find the search box on the register page")
 
-    def is_this_search(r):
-        return (
-            "/api/search/getpredictions" in r.url.lower()
-            and number in (r.request.post_data or "").upper()
-        )
+    seen = []
 
+    def on_resp(r):
+        try:
+            if (
+                "/api/search/getpredictions" in r.url.lower()
+                and number in (r.request.post_data or "").upper()
+            ):
+                seen.append(r)
+        except Exception:  # noqa: BLE001
+            pass
+
+    page.on("response", on_resp)
+    status = 0
     try:
         box.click()
         box.fill("")
-        with page.expect_response(is_this_search, timeout=20000) as info:
-            box.press_sequentially(number, delay=90)
-        resp = info.value
-        return {"status": resp.status, "text": resp.text()}
-    except Exception as e:  # noqa: BLE001
-        return {"status": 0, "text": "", "error": f"no search response seen ({_first_line(e)})"}
+        box.press_sequentially(number, delay=90)
+        # Give the page's own scripts time to finish any bot check, then read the answer.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            for r in list(seen):
+                status = r.status
+                try:
+                    text = r.text()
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if text.strip():
+                    return {"status": status, "text": text}
+            page.wait_for_timeout(500)
+    finally:
+        page.remove_listener("response", on_resp)
+
+    info = _pg_overlay_info(page)
+    desc = _describe_overlay(info)
+    for f in info.get("frames", []):
+        if f.get("visible") and any(
+            m in (f.get("src") or "").lower()
+            for m in ("captcha", "turnstile", "challenge", "tspd")
+        ):
+            raise LookupFailed(
+                "A human check (CAPTCHA/challenge) is being shown. Stopping; "
+                "this app won't try to bypass it.",
+                hard=True, snippet=desc,
+            )
+    return {
+        "status": status or 0,
+        "text": "",
+        "overlay": desc,
+        "error": "" if seen else "page never made the search request",
+    }
 
 
 def _pg_profile(page, number, row_id):
@@ -404,11 +475,12 @@ def warm_up(sess):
 
 def get_predictions(sess, number):
     """In-page GetPredictions call. Returns parsed JSON dict. Retries once after a reload."""
-    last, text = "an empty response", ""
+    last, text, overlay = "an empty response", "", ""
     for attempt in range(2):
         res = sess.call(_pg_predict, number)
         status = res.get("status")
         text = (res.get("text") or "").strip()
+        overlay = res.get("overlay") or overlay
         if status in (403, 429):
             last = f"HTTP {status}"
         elif status == 200 and text:
@@ -427,7 +499,8 @@ def get_predictions(sess, number):
             warm_up(sess)
             time.sleep(random.uniform(2.0, 4.0))
     raise LookupFailed(
-        f"Search returned {last} (bot check likely not passed)", blocked=True, snippet=text[:500]
+        f"Search returned {last} (bot check likely not passed)", blocked=True,
+        snippet=(f"On the page: {overlay}\n" if overlay else "") + text[:500],
     )
 
 
