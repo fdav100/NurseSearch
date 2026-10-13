@@ -1,5 +1,5 @@
 streamlit>=1.50
-requests>=2.31
+playwright>=1.49
 beautifulsoup4>=4.12
 pandas>=2.0
 openpyxl>=3.1

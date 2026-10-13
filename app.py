@@ -32,7 +32,7 @@ def check_password():
             return
         st.error(
             "No password is configured. Add `APP_PASSWORD` to the app's Secrets "
-            "(or set the environment variable ALLOW_NO_PASSWORD=1 for local use)."
+            "(or set the environment variable ALLOW_NO_PASSWORD=1 for testing)."
         )
         st.stop()
 
@@ -50,6 +50,28 @@ def check_password():
 
 
 check_password()
+
+
+# --------------------------------------------------------------------------
+# Browser (one shared headless Chromium for the whole app)
+# --------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Starting the browser (first start can take a minute or two)...")
+def get_browser():
+    ahpra.ensure_chromium()
+    return ahpra.BrowserSession()
+
+
+def get_session():
+    try:
+        sess = get_browser()
+        if not sess.alive():
+            get_browser.clear()
+            sess = get_browser()
+        return sess
+    except ahpra.LookupFailed as e:
+        st.error(f"Couldn't start the browser: {e}")
+        st.stop()
+
 
 # --------------------------------------------------------------------------
 # State
@@ -101,10 +123,11 @@ if numbers:
         msg += f" Unusual format (will still be searched): {', '.join(odd[:10])}"
     st.caption(msg)
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 start = c1.button("Start lookup", type="primary", disabled=not numbers)
 retry = c2.button("Retry errors", disabled=not error_numbers())
 test = c3.button("Test first number (diagnostics)", disabled=not numbers)
+restart = c4.button("Restart browser", help="Use if the browser seems stuck.")
 
 table_area = st.empty()
 
@@ -117,78 +140,100 @@ def render_table():
         table_area.dataframe(df, hide_index=True)
 
 
+BLOCK_ADVICE = (
+    "Options: wait and try again later, increase the delay, or move the app to a host "
+    "that isn't a shared cloud IP (e.g. a Docker-based service), or use AHPRA's own API."
+)
+
+
 # --------------------------------------------------------------------------
 # Diagnostics
 # --------------------------------------------------------------------------
-def snippet(r, n=500):
-    return (r.text or "")[:n]
-
-
 def run_diagnostics(number):
     st.subheader("Diagnostics")
-    s = ahpra.new_session()
-    steps = [
-        ("1. Load register page", lambda: ahpra.warm_up(s)),
-        ("2. GetPredictions", lambda: ahpra.get_predictions(s, number)),
-        ("3. Profile POST", lambda: ahpra.get_profile(s, number)),
-    ]
-    for label, fn in steps:
-        try:
-            r = fn()
-        except ahpra.LookupFailed as e:
-            st.error(f"{label}: {e}")
-            if e.blocked:
-                st.info("Looks blocked. Try running the app locally instead.")
-            return
-        blocked = ahpra.looks_blocked(r)
-        (st.error if blocked else st.success)(
-            f"{label}: HTTP {r.status_code}"
-            f"{' - looks like a bot-protection page' if blocked else ''}"
-        )
-        with st.expander(f"{label}: response start"):
-            st.code(snippet(r))
-        if blocked:
-            return
-        time.sleep(random.uniform(1.0, 2.0))
-        if label.startswith("3"):
-            parsed = ahpra.parse_profile(r.text, number)
-            st.write("Parsed profile:", parsed if parsed else "Could not parse expected fields")
+    sess = get_session()
+    if not sess.run_lock.acquire(blocking=False):
+        st.warning("Another run is using the browser. Wait for it to finish, then try again.")
+        return
+    all_ok = True
+    try:
+        for step in ahpra.diagnose(sess, number):
+            (st.success if step["ok"] else st.error)(f"{step['label']}: {step['summary']}")
+            if step.get("snippet"):
+                with st.expander(f"{step['label']}: start of page HTML"):
+                    st.code(step["snippet"])
+            if step.get("screenshot"):
+                st.image(step["screenshot"], caption="What the browser saw")
+            if step.get("parsed"):
+                st.write("Parsed profile:", step["parsed"])
+            all_ok = all_ok and step["ok"]
+    finally:
+        sess.run_lock.release()
+    if all_ok:
+        st.success("The browser got through. You can run a full lookup.")
+    else:
+        st.error(f"Not working from here yet. {BLOCK_ADVICE}")
 
 
 # --------------------------------------------------------------------------
 # Run loop
 # --------------------------------------------------------------------------
 def run(batch):
-    st.button("Stop run", help="Results so far stay on screen and can be downloaded.")
-    progress = st.progress(0.0)
-    status = st.empty()
-    s = ahpra.new_session()
-
-    try:
-        ahpra.warm_up(s)
-    except ahpra.LookupFailed as e:
-        status.error(f"Couldn't load the AHPRA register page: {e}")
+    sess = get_session()
+    if not sess.run_lock.acquire(blocking=False):
+        st.warning("Another run is using the browser. Wait for it to finish, then try again.")
         return
+    try:
+        st.button("Stop run", help="Results so far stay on screen and can be downloaded.")
+        progress = st.progress(0.0)
+        status = st.empty()
 
-    consecutive_blocked = 0
-    for i, number in enumerate(batch):
-        status.info(f"Looking up {number} ({i + 1} of {len(batch)})...")
-        row, blocked = ahpra.lookup(s, number)
-        st.session_state.results[number] = row
-        render_table()
-        progress.progress((i + 1) / len(batch))
-
-        consecutive_blocked = consecutive_blocked + 1 if blocked else 0
-        if consecutive_blocked >= 3:
-            status.error(
-                "Stopped: 3 lookups in a row were blocked by bot protection. "
-                "Wait a while, increase the delay, or run the app locally."
-            )
+        status.info("Opening the AHPRA register page in the browser...")
+        try:
+            ahpra.warm_up(sess)
+        except ahpra.LookupFailed as e:
+            status.error(f"Couldn't load the AHPRA register page: {e}")
+            if e.blocked:
+                st.info(BLOCK_ADVICE)
             return
-        if i < len(batch) - 1:
-            time.sleep(random.uniform(*delay))
-    status.success("Done.")
 
+        consecutive_blocked = 0
+        for i, number in enumerate(batch):
+            status.info(f"Looking up {number} ({i + 1} of {len(batch)})...")
+            row, blocked, hard = ahpra.lookup(sess, number)
+            st.session_state.results[number] = row
+            render_table()
+            progress.progress((i + 1) / len(batch))
+
+            if hard:
+                status.error(
+                    "Stopped: AHPRA is showing a CAPTCHA or hard block. This app doesn't try "
+                    f"to get past that. {BLOCK_ADVICE}"
+                )
+                return
+            consecutive_blocked = consecutive_blocked + 1 if blocked else 0
+            if consecutive_blocked >= 3:
+                status.error(
+                    "Stopped: 3 lookups in a row were blocked by bot protection. "
+                    f"{BLOCK_ADVICE}"
+                )
+                return
+            if i < len(batch) - 1:
+                wait = random.uniform(*delay)
+                status.info(f"Done {number}. Waiting {wait:.0f}s before the next one...")
+                time.sleep(wait)
+        status.success("Done.")
+    finally:
+        sess.run_lock.release()
+
+
+if restart:
+    try:
+        get_browser().close()
+    except Exception:
+        pass
+    get_browser.clear()
+    st.success("Browser will restart on the next lookup.")
 
 if start:
     st.session_state.order = numbers
