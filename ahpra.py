@@ -317,9 +317,47 @@ def _ensure_loaded(page):
         _pg_load(page)
 
 
+SEARCH_BOX = (
+    'input[name="name-reg"]:visible, '
+    'input[placeholder*="Registration Number" i]:visible'
+)
+
+
+def _find_search_box(page):
+    box = page.locator(SEARCH_BOX).first
+    try:
+        box.wait_for(state="visible", timeout=8000)
+        return box
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _pg_predict(page, number):
+    """Type the number into the site's own search box (like a visitor would) and read the
+    response to the page's own GetPredictions request."""
     _ensure_loaded(page)
-    return page.evaluate(PREDICT_JS, number)
+    box = _find_search_box(page)
+    if box is None:
+        _pg_load(page)
+        box = _find_search_box(page)
+    if box is None:
+        raise LookupFailed("Couldn't find the search box on the register page")
+
+    def is_this_search(r):
+        return (
+            "/api/search/getpredictions" in r.url.lower()
+            and number in (r.request.post_data or "").upper()
+        )
+
+    try:
+        box.click()
+        box.fill("")
+        with page.expect_response(is_this_search, timeout=20000) as info:
+            box.press_sequentially(number, delay=90)
+        resp = info.value
+        return {"status": resp.status, "text": resp.text()}
+    except Exception as e:  # noqa: BLE001
+        return {"status": 0, "text": "", "error": f"no search response seen ({_first_line(e)})"}
 
 
 def _pg_profile(page, number, row_id):
